@@ -1,0 +1,192 @@
+/*
+  ESP32 DevKit V1
+  FireBoltt BLE → OLED Dashboard (SSD1306 128x64)
+  Displays: Heart Rate (live), SpO2, AI prediction, BLE status
+  Prasanna - 2025
+*/
+
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <BLEDevice.h>
+#include <BLEUtils.h>
+#include <BLEClient.h>
+
+// ---------- OLED config ----------
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+const int I2C_SDA = 21;
+const int I2C_SCL = 22;
+const uint8_t OLED_ADDR = 0x3C; // I2C address
+
+// ---------- FireBoltt BLE ----------
+static BLEAddress firebolttAddress("71:16:a0:eb:52:9e");  // Your watch BLE address
+static BLEUUID heartServiceUUID((uint16_t)0x180D);
+static BLEUUID heartCharUUID((uint16_t)0x2A37);
+
+BLEClient* pClient = nullptr;
+BLERemoteCharacteristic* pHeartChar = nullptr;
+
+// ---------- Shared State ----------
+volatile int latestHR = -1;
+volatile bool hrUpdated = false;
+volatile unsigned long lastNotificationMillis = 0;
+bool bleConnected = false;
+
+// Constant SpO2
+const int constantSpO2 = 97;
+
+// ---------- Heart Rate Notification ----------
+static void heartRateNotifyCallback(BLERemoteCharacteristic*, uint8_t* pData, size_t length, bool) {
+  if (length > 1) {
+    uint8_t hr = pData[1];
+    latestHR = (int)hr;
+    hrUpdated = true;
+    lastNotificationMillis = millis();
+
+    // Serial print HR data
+    Serial.print("❤️ Heart Rate: ");
+    Serial.print(latestHR);
+    Serial.println(" bpm");
+  }
+}
+
+// ---------- BLE Connect ----------
+bool connectToWatch() {
+  if (pClient && pClient->isConnected()) return true;
+  if (!pClient) pClient = BLEDevice::createClient();
+
+  Serial.println("🔄 Connecting to FireBoltt...");
+  if (!pClient->connect(firebolttAddress)) {
+    Serial.println("❌ Connection failed");
+    bleConnected = false;
+    return false;
+  }
+  Serial.println("✅ Connected to FireBoltt Watch");
+  bleConnected = true;
+
+  BLERemoteService* pHeartService = pClient->getService(heartServiceUUID);
+  if (pHeartService) {
+    pHeartChar = pHeartService->getCharacteristic(heartCharUUID);
+    if (pHeartChar && pHeartChar->canNotify()) {
+      pHeartChar->registerForNotify(heartRateNotifyCallback);
+      Serial.println("💓 Heart-rate notifications enabled");
+    } else {
+      Serial.println("⚠️ Heart-rate characteristic not found or can't notify");
+    }
+  } else {
+    Serial.println("⚠️ Heart-rate service not found");
+  }
+  return true;
+}
+
+// ---------- AI Prediction ----------
+String aiPredict(int hr) {
+  if (hr < 50) return "Relaxed State";
+  if (hr >= 50 && hr <= 90) return "Normal Health";
+  if (hr > 90 && hr <= 110) return "You are Stressed";
+  if (hr > 110) return "⚠ High Stress";
+  return "Analyzing...";
+}
+
+// ---------- Draw Dashboard ----------
+void drawDashboard() {
+  display.clearDisplay();
+
+  // Title
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(10, 0);
+  display.print("💡 AI Health Dashboard");
+
+  // Connection Status
+  display.setCursor(0, 10);
+  display.setTextSize(1);
+  if (bleConnected) {
+    display.print("BLE: Connected");
+  } else {
+    display.print("BLE: Disconnected");
+  }
+
+  // Heart Rate
+  display.setTextSize(2);
+  display.setCursor(0, 24);
+  display.print("HR:");
+  if (latestHR > 0) {
+    display.setCursor(36, 24);
+    display.print(latestHR);
+    display.print(" bpm");
+  } else {
+    display.setCursor(36, 24);
+    display.print("-- bpm");
+  }
+
+  // Constant SpO2
+  display.setTextSize(2);
+  display.setCursor(0, 46);
+  display.print("O2:");
+  display.setCursor(36, 46);
+  display.print(constantSpO2);
+  display.print("%");
+
+  // AI prediction line
+  display.setTextSize(1);
+  display.setCursor(0, 60);
+  if (latestHR > 0) display.print(aiPredict(latestHR));
+  else display.print("AI: Waiting for data...");
+
+  display.display();
+}
+
+// ---------- Setup ----------
+void setup() {
+  Serial.begin(115200);
+  Wire.begin(I2C_SDA, I2C_SCL);
+
+  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
+    Serial.println("❌ OLED init failed");
+    while (1);
+  }
+
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setCursor(10, 30);
+  display.print("Starting Dashboard...");
+  display.display();
+
+  BLEDevice::init("");
+  connectToWatch();
+}
+
+// ---------- Loop ----------
+unsigned long lastReconnect = 0;
+unsigned long lastDisplay = 0;
+
+void loop() {
+  // Reconnect BLE if disconnected
+  if (!pClient || !pClient->isConnected()) {
+    if (bleConnected) {
+      Serial.println("⚠️ BLE Disconnected");
+    }
+    bleConnected = false;
+    if (millis() - lastReconnect > 5000) {
+      lastReconnect = millis();
+      connectToWatch();
+    }
+  } else if (!bleConnected) {
+    bleConnected = true;
+    Serial.println("✅ BLE Reconnected");
+  }
+
+  // Update OLED every 800ms or when HR changes
+  if (millis() - lastDisplay > 800 || hrUpdated) {
+    lastDisplay = millis();
+    drawDashboard();
+    hrUpdated = false;
+  }
+
+  delay(50);
+}
